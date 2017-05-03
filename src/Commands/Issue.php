@@ -2,209 +2,217 @@
 
 namespace Kelunik\AcmeClient\Commands;
 
-use Amp\Dns as dns;
+use Amp\CoroutineResult;
 use Amp\Dns\Record;
-use Amp\Promise;
-use Generator;
-use Kelunik\Acme\AcmeClient;
+use Exception;
 use Kelunik\Acme\AcmeException;
 use Kelunik\Acme\AcmeService;
 use Kelunik\Acme\KeyPair;
 use Kelunik\Acme\OpenSSLKeyGenerator;
+use Kelunik\AcmeClient\AcmeFactory;
+use Kelunik\AcmeClient\Stores\CertificateStore;
+use Kelunik\AcmeClient\Stores\ChallengeStore;
+use Kelunik\AcmeClient\Stores\KeyStore;
+use Kelunik\AcmeClient\Stores\KeyStoreException;
 use League\CLImate\Argument\Manager;
-use Psr\Log\LoggerInterface;
+use League\CLImate\CLImate;
 use stdClass;
 use Throwable;
-use function Amp\all;
-use function Amp\any;
-use function Amp\resolve;
 
 class Issue implements Command {
-    private $logger;
+    private $climate;
+    private $acmeFactory;
 
-    public function __construct(LoggerInterface $logger) {
-        $this->logger = $logger;
+    public function __construct(CLImate $climate, AcmeFactory $acmeFactory) {
+        $this->climate = $climate;
+        $this->acmeFactory = $acmeFactory;
     }
 
-    public function execute(Manager $args): Promise {
-        return resolve($this->doExecute($args));
+    public function execute(Manager $args) {
+        return \Amp\resolve($this->doExecute($args));
     }
 
-    private function doExecute(Manager $args): Generator {
-        if (posix_geteuid() !== 0) {
-            throw new AcmeException("Please run this script as root!");
-        }
+    private function doExecute(Manager $args) {
+        if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
+            if (posix_geteuid() !== 0) {
+                $processUser = posix_getpwnam(posix_geteuid());
+                $currentUsername = $processUser["name"];
+                $user = $args->get("user") ?: $currentUsername;
 
-        $user = $args->get("user") ?? "www-data";
-
-        $server = $args->get("server");
-        $protocol = substr($server, 0, strpos("://", $server));
-
-        if (!$protocol || $protocol === $server) {
-            $server = "https://" . $server;
-        } elseif ($protocol !== "https") {
-            throw new \InvalidArgumentException("Invalid server protocol, only HTTPS supported");
-        }
-
-        $domains = $args->get("domains");
-        $domains = array_map("trim", explode(",", $domains));
-        yield from $this->checkDnsRecords($domains);
-
-        $keyPair = $this->checkRegistration($args);
-
-        $acme = new AcmeService(new AcmeClient($server, $keyPair), $keyPair);
-
-        foreach ($domains as $domain) {
-            list($location, $challenges) = yield $acme->requestChallenges($domain);
-            $goodChallenges = $this->findSuitableCombination($challenges);
-
-            if (empty($goodChallenges)) {
-                throw new AcmeException("Couldn't find any combination of challenges which this server can solve!");
-            }
-
-            $challenge = $challenges->challenges[reset($goodChallenges)];
-            $token = $challenge->token;
-
-            if (!preg_match("#^[a-zA-Z0-9-_]+$#", $token)) {
-                throw new AcmeException("Protocol Violation: Invalid Token!");
-            }
-
-            $this->logger->debug("Generating payload...");
-            $payload = $acme->generateHttp01Payload($token);
-
-            $docRoot = rtrim($args->get("path") ?? __DIR__ . "/../../data/public", "/\\");
-            $path = $docRoot . "/.well-known/acme-challenge";
-
-            try {
-                if (!file_exists($docRoot)) {
-                    throw new AcmeException("Document root doesn't exist: " . $docRoot);
+                if ($currentUsername !== $user) {
+                    throw new AcmeException("Running this script with --user only works as root!");
                 }
-
-                if (!file_exists($path) && !@mkdir($path, 0770, true)) {
-                    throw new AcmeException("Couldn't create public dir to serve the challenges: " . $path);
-                }
-
-                if (!$userInfo = posix_getpwnam($user)) {
-                    throw new AcmeException("Unknown user: " . $user);
-                }
-
-                chown($docRoot . "/.well-known", $userInfo["uid"]);
-                chown($docRoot . "/.well-known/acme-challenge", $userInfo["uid"]);
-
-                $this->logger->info("Providing payload for {$domain} at {$path}/{$token}");
-
-                file_put_contents("{$path}/{$token}", $payload);
-                chown("{$path}/{$token}", $userInfo["uid"]);
-                chmod("{$path}/{$token}", 0660);
-
-                yield $acme->selfVerify($domain, $token, $payload);
-                $this->logger->info("Successfully self-verified challenge.");
-
-                yield $acme->answerChallenge($challenge->uri, $payload);
-                $this->logger->info("Answered challenge... waiting");
-
-                yield $acme->pollForChallenge($location);
-                $this->logger->info("Challenge successful. {$domain} is now authorized.");
-
-                @unlink("{$path}/{$token}");
-            } catch (Throwable $e) {
-                // no finally because generators...
-                @unlink("{$path}/{$token}");
-                throw $e;
+            } else {
+                $user = $args->get("user") ?: "www-data";
             }
         }
 
-        $path = __DIR__ . "/../../data/live/" . $args->get("file") ?? current($domains);
+        $domains = array_map("trim", explode(":", str_replace([",", ";"], ":", $args->get("domains"))));
+        yield \Amp\resolve($this->checkDnsRecords($domains));
 
-        if (!file_exists($path) && !mkdir($path, 0700, true)) {
-            throw new AcmeException("Couldn't create directory: {$path}");
+        $docRoots = explode(PATH_SEPARATOR, str_replace("\\", "/", $args->get("path")));
+        $docRoots = array_map(function ($root) {
+            return rtrim($root, "/");
+        }, $docRoots);
+
+        if (count($domains) < count($docRoots)) {
+            throw new AcmeException("Specified more document roots than domains.");
         }
 
-        if (file_exists($path . "/private.pem") && file_exists($path . "/public.pem")) {
-            $private = file_get_contents($path . "/private.pem");
-            $public = file_get_contents($path . "/public.pem");
-
-            $this->logger->info("Using existing domain key found at {$path}");
-
-            $domainKeys = new KeyPair($private, $public);
-        } else {
-            $domainKeys = (new OpenSSLKeyGenerator)->generate(2048);
-
-            file_put_contents($path . "/private.pem", $domainKeys->getPrivate());
-            file_put_contents($path . "/public.pem", $domainKeys->getPublic());
-
-            $this->logger->info("Saved new domain key at {$path}");
-
-            chmod($path . "/private.pem", 0600);
-            chmod($path . "/public.pem", 0600);
+        if (count($domains) > count($docRoots)) {
+            $docRoots = array_merge(
+                $docRoots,
+                array_fill(count($docRoots), count($domains) - count($docRoots), end($docRoots))
+            );
         }
 
-        $this->logger->info("Requesting certificate ...");
+        $keyStore = new KeyStore(\Kelunik\AcmeClient\normalizePath($args->get("storage")));
 
-        $location = yield $acme->requestCertificate($domainKeys, $domains);
-        $certificates = yield $acme->pollForCertificate($location);
+        $server = \Kelunik\AcmeClient\resolveServer($args->get("server"));
+        $keyFile = \Kelunik\AcmeClient\serverToKeyname($server);
 
-        $this->logger->info("Saving certificate ...");
-
-        file_put_contents($path . "/cert.pem", reset($certificates));
-        file_put_contents($path . "/fullchain.pem", implode("\n", $certificates));
-
-        array_shift($certificates);
-        file_put_contents($path . "/chain.pem", implode("\n", $certificates));
-
-        $this->logger->info("Successfully issued certificate.");
-    }
-
-    private function checkDnsRecords($domains): Generator {
-        $promises = [];
-
-        foreach ($domains as $domain) {
-            $promises[$domain] = dns\resolve($domain, [
-                "types" => [Record::A],
-                "hosts" => false,
-            ]);
+        try {
+            $keyPair = (yield $keyStore->get("accounts/{$keyFile}.pem"));
+        } catch (KeyStoreException $e) {
+            throw new AcmeException("Account key not found, did you run 'bin/acme setup'?", 0, $e);
         }
 
-        list($errors) = yield any($promises);
+        $this->climate->br();
+
+        $acme = $this->acmeFactory->build($server, $keyPair);
+        $errors = [];
+
+        $concurrency = $args->get("challenge-concurrency");
+
+        $domainChunks = array_chunk($domains, \min(20, \max($concurrency, 1)), true);
+
+        foreach ($domainChunks as $domainChunk) {
+            $promises = [];
+
+            foreach ($domainChunk as $i => $domain) {
+                $promises[] = \Amp\resolve($this->solveChallenge($acme, $keyPair, $domain, $docRoots[$i]));
+            }
+
+            list($chunkErrors) = (yield \Amp\any($promises));
+
+            $errors += $chunkErrors;
+        }
 
         if (!empty($errors)) {
-            throw new AcmeException("Couldn't resolve the following domains to an IPv4 record: " . implode(array_keys($errors)));
+            foreach ($errors as $error) {
+                $this->climate->error($error->getMessage());
+            }
+
+            throw new AcmeException("Issuance failed, not all challenges could be solved.");
         }
 
-        $this->logger->info("Checked DNS records, all fine.");
+<<<<<<< HEAD
+        $path = __DIR__ . "/../../data/live/" . $args->get("file") ?? current($domains);
+=======
+        $path = "certs/" . $keyFile . "/" . reset($domains) . "/key.pem";
+        $bits = $args->get("bits");
+>>>>>>> master/master
+
+        try {
+            $keyPair = (yield $keyStore->get($path));
+        } catch (KeyStoreException $e) {
+            $keyPair = (new OpenSSLKeyGenerator)->generate($bits);
+            $keyPair = (yield $keyStore->put($path, $keyPair));
+        }
+
+        $this->climate->br();
+        $this->climate->whisper("    Requesting certificate ...");
+
+        $location = (yield $acme->requestCertificate($keyPair, $domains));
+        $certificates = (yield $acme->pollForCertificate($location));
+
+        $path = \Kelunik\AcmeClient\normalizePath($args->get("storage")) . "/certs/" . $keyFile;
+        $certificateStore = new CertificateStore($path);
+        yield $certificateStore->put($certificates);
+
+        $this->climate->info("    Successfully issued certificate.");
+        $this->climate->info("    See {$path}/" . reset($domains));
+        $this->climate->br();
+
+        yield new CoroutineResult(0);
     }
 
-    private function checkRegistration(Manager $args) {
-        $server = $args->get("server");
-        $protocol = substr($server, 0, strpos("://", $server));
+    private function solveChallenge(AcmeService $acme, KeyPair $keyPair, $domain, $path) {
+        list($location, $challenges) = (yield $acme->requestChallenges($domain));
+        $goodChallenges = $this->findSuitableCombination($challenges);
 
-        if (!$protocol || $protocol === $server) {
-            $server = "https://" . $server;
-        } elseif ($protocol !== "https") {
-            throw new \InvalidArgumentException("Invalid server protocol, only HTTPS supported");
+        if (empty($goodChallenges)) {
+            throw new AcmeException("Couldn't find any combination of challenges which this client can solve!");
         }
 
-        $identity = str_replace(["/", "%"], "-", substr($server, 8));
+        $challenge = $challenges->challenges[reset($goodChallenges)];
+        $token = $challenge->token;
 
-        $path = __DIR__ . "/../../data/accounts";
-        $pathPrivate = "{$path}/{$identity}.private.key";
-        $pathPublic = "{$path}/{$identity}.public.key";
-
-        if (file_exists($pathPrivate) && file_exists($pathPublic)) {
-            $private = file_get_contents($pathPrivate);
-            $public = file_get_contents($pathPublic);
-
-            $this->logger->info("Found account keys.");
-
-            return new KeyPair($private, $public);
+        if (!preg_match("#^[a-zA-Z0-9-_]+$#", $token)) {
+            throw new AcmeException("Protocol violation: Invalid Token!");
         }
 
-        throw new AcmeException("No registration found for server, please register first");
+        $payload = $acme->generateHttp01Payload($keyPair, $token);
+
+        $this->climate->whisper("    Providing payload at http://{$domain}/.well-known/acme-challenge/{$token}");
+
+        $challengeStore = new ChallengeStore($path);
+
+        try {
+            yield $challengeStore->put($token, $payload, isset($user) ? $user : null);
+
+            yield $acme->verifyHttp01Challenge($domain, $token, $payload);
+            yield $acme->answerChallenge($challenge->uri, $payload);
+            yield $acme->pollForChallenge($location);
+
+            $this->climate->comment("    {$domain} is now authorized.");
+
+            yield $challengeStore->delete($token);
+        } catch (Exception $e) {
+            // no finally because generators...
+            yield $challengeStore->delete($token);
+            throw $e;
+        } catch (Throwable $e) {
+            // no finally because generators...
+            yield $challengeStore->delete($token);
+            throw $e;
+        }
     }
 
-    private function findSuitableCombination(stdClass $response): array {
-        $challenges = $response->challenges ?? [];
-        $combinations = $response->combinations ?? [];
+    private function checkDnsRecords($domains) {
+        $errors = [];
+
+        $domainChunks = array_chunk($domains, 10, true);
+
+        foreach ($domainChunks as $domainChunk) {
+            $promises = [];
+
+            foreach ($domainChunk as $domain) {
+                $promises[$domain] = \Amp\Dns\resolve($domain, [
+                    "types" => [Record::A, Record::AAAA],
+                    "hosts" => false,
+                ]);
+            }
+
+            list($chunkErrors) = (yield \Amp\any($promises));
+
+            $errors += $chunkErrors;
+        }
+
+        if (!empty($errors)) {
+            $failedDomains = implode(", ", array_keys($errors));
+            $reasons = implode("\n\n", array_map(function ($exception) {
+                /** @var \Exception|\Throwable $exception */
+                return get_class($exception) . ": " . $exception->getMessage();
+            }, $errors));
+
+            throw new AcmeException("Couldn't resolve the following domains to an IPv4 nor IPv6 record: {$failedDomains}\n\n{$reasons}");
+        }
+    }
+
+    private function findSuitableCombination(stdClass $response) {
+        $challenges = isset($response->challenges) ? $response->challenges : [];
+        $combinations = isset($response->combinations) ? $response->combinations : [];
         $goodChallenges = [];
 
         foreach ($challenges as $i => $challenge) {
@@ -222,31 +230,38 @@ class Issue implements Command {
         return $goodChallenges;
     }
 
-    public static function getDefinition(): array {
+    public static function getDefinition() {
         return [
+            "server" => \Kelunik\AcmeClient\getArgumentDescription("server"),
+            "storage" => \Kelunik\AcmeClient\getArgumentDescription("storage"),
             "domains" => [
                 "prefix" => "d",
                 "longPrefix" => "domains",
-                "description" => "Domains to request a certificate for.",
+                "description" => "Colon / Semicolon / Comma separated list of domains to request a certificate for.",
                 "required" => true,
-            ],
-            "server" => [
-                "prefix" => "s",
-                "longPrefix" => "server",
-                "description" => "ACME server to use for authorization.",
-                "required" => true,
-            ],
-            "user" => [
-                "prefix" => "s",
-                "longPrefix" => "user",
-                "description" => "User for the public directory.",
-                "required" => false,
             ],
             "path" => [
                 "prefix" => "p",
                 "longPrefix" => "path",
-                "description" => "Path to the document root for ACME challenges.",
-                "required" => false,
+                "description" => "Colon (Unix) / Semicolon (Windows) separated list of paths to the document roots. The last one will be used for all remaining ones if fewer than the amount of domains is given.",
+                "required" => true,
+            ],
+            "user" => [
+                "prefix" => "u",
+                "longPrefix" => "user",
+                "description" => "User running the web server.",
+            ],
+            "bits" => [
+                "longPrefix" => "bits",
+                "description" => "Length of the private key in bit.",
+                "defaultValue" => 2048,
+                "castTo" => "int",
+            ],
+            "challenge-concurrency" => [
+                "longPrefix" => "challenge-concurrency",
+                "description" => "Number of challenges to be solved concurrently.",
+                "defaultValue" => 10,
+                "castTo" => "int",
             ],
             "file" => [
                 "prefix" => "f",
