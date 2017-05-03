@@ -10,7 +10,7 @@ use Webmozart\Assert\Assert;
 
 class CertificateStore {
     private $root;
-    private $forcedPath;
+    private $outputDir;
 
     public function __construct($root) {
         if (!is_string($root)) {
@@ -27,7 +27,7 @@ class CertificateStore {
      * @return void
      */
     public function useDirectory($name) {
-        $this->forcedPath = $name;
+        $this->outputDir = $name;
     }
 
     public function get($name) {
@@ -68,7 +68,7 @@ class CertificateStore {
 
         try {
             $chain = array_slice($certificates, 1);
-            $path = $this->root . "/" . $this->forcedPath ?? $commonName;
+            $path = $this->root . "/" . $this->outputDir ?? $commonName;
             $realpath = realpath($path);
 
             if (!$realpath && !mkdir($path, 0775, true)) {
@@ -94,7 +94,7 @@ class CertificateStore {
 
     private function doDelete($name) {
         Assert::string($name, "Name must be a string. Got: %s");
-        $localPath = $this->forcedPath ?? $name;
+        $localPath = $this->outputDir ?? $name;
         foreach ((yield \Amp\File\scandir($this->root . "/" . $localPath)) as $file) {
             yield \Amp\File\unlink($this->root . "/" . $localPath . "/" . $file);
         }
