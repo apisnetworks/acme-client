@@ -10,6 +10,7 @@ use Webmozart\Assert\Assert;
 
 class CertificateStore {
     private $root;
+    private $forcedPath;
 
     public function __construct($root) {
         if (!is_string($root)) {
@@ -17,6 +18,16 @@ class CertificateStore {
         }
 
         $this->root = rtrim(str_replace("\\", "/", $root), "/");
+    }
+
+    /**
+     * Force a storage path instead of the first certificate CN
+     *
+     * @param string$name
+     * @return void
+     */
+    public function useDirectory($name) {
+        $this->forcedPath = $name;
     }
 
     public function get($name) {
@@ -57,7 +68,7 @@ class CertificateStore {
 
         try {
             $chain = array_slice($certificates, 1);
-            $path = $this->root . "/" . $commonName;
+            $path = $this->root . "/" . $this->forcedPath ?? $commonName;
             $realpath = realpath($path);
 
             if (!$realpath && !mkdir($path, 0775, true)) {
@@ -83,11 +94,11 @@ class CertificateStore {
 
     private function doDelete($name) {
         Assert::string($name, "Name must be a string. Got: %s");
-
-        foreach ((yield \Amp\File\scandir($this->root . "/" . $name)) as $file) {
-            yield \Amp\File\unlink($this->root . "/" . $name . "/" . $file);
+        $localPath = $this->forcedPath ?? $name;
+        foreach ((yield \Amp\File\scandir($this->root . "/" . $localPath)) as $file) {
+            yield \Amp\File\unlink($this->root . "/" . $localPath . "/" . $file);
         }
 
-        yield \Amp\File\rmdir($this->root . "/" . $name);
+        yield \Amp\File\rmdir($this->root . "/" . $localPath);
     }
 }

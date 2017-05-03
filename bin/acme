@@ -12,8 +12,14 @@ $logo = <<<LOGO
   \__,_/\___/_/ /_/ /_/\___/
 
 LOGO;
-
-if (!file_exists(__DIR__ . "/../vendor/autoload.php")) {
+$dirs = explode(DIRECTORY_SEPARATOR, __DIR__);
+for ($i = count($dirs); $i >= 0; $i--) {
+    $dir = implode(DIRECTORY_SEPARATOR, array_slice($dirs, 0, $i));
+    if (file_exists($dir . DIRECTORY_SEPARATOR . 'autoload.php')) {
+        break;
+    }
+}
+if (!file_exists($dir)) {
     echo $logo;
     echo <<<HELP
 
@@ -37,7 +43,7 @@ HELP;
     exit(-2);
 }
 
-require __DIR__ . "/../vendor/autoload.php";
+require $dir . DIRECTORY_SEPARATOR . "autoload.php";
 
 $commands = [
     "auto" => "Setup, issue and renew based on a single configuration file.",

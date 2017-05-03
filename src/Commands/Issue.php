@@ -106,12 +106,9 @@ class Issue implements Command {
             throw new AcmeException("Issuance failed, not all challenges could be solved.");
         }
 
-<<<<<<< HEAD
-        $path = __DIR__ . "/../../data/live/" . $args->get("file") ?? current($domains);
-=======
-        $path = "certs/" . $keyFile . "/" . reset($domains) . "/key.pem";
+        $forceName = $args->get('file');
+        $path = "certs/" . $keyFile . ($forceName ? '/' . $forceName : '') . "/key.pem";
         $bits = $args->get("bits");
->>>>>>> master/master
 
         try {
             $keyPair = (yield $keyStore->get($path));
@@ -128,10 +125,13 @@ class Issue implements Command {
 
         $path = \Kelunik\AcmeClient\normalizePath($args->get("storage")) . "/certs/" . $keyFile;
         $certificateStore = new CertificateStore($path);
+        if ($forceName) {
+            $certificateStore->useDirectory($forceName);
+        }
         yield $certificateStore->put($certificates);
 
         $this->climate->info("    Successfully issued certificate.");
-        $this->climate->info("    See {$path}/" . reset($domains));
+        $this->climate->info("    See {$path}/" . $forceName ?? reset($domains));
         $this->climate->br();
 
         yield new CoroutineResult(0);
@@ -266,7 +266,7 @@ class Issue implements Command {
             "file" => [
                 "prefix" => "f",
                 "longPrefix" => "file",
-                "descript" => "Output filename",
+                "description" => "Certificate output directory (defaults to CN)",
                 "required" => false,
             ]
         ];
