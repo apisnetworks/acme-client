@@ -1,17 +1,30 @@
 {
     "name": "kelunik/acme-client",
-    "description": "Standalone PHP ACME client.",
+    "description": "Let's Encrypt / ACME client written in PHP for the CLI.",
+    "keywords": [
+        "ACME",
+        "letsencrypt",
+        "certificate",
+        "https",
+        "encryption",
+        "ssl",
+        "tls"
+    ],
     "require": {
-        "php": ">=7.0.0",
-        "ext-posix": "*",
+        "php": "^5.5|^7",
         "ext-openssl": "*",
-        "bramus/monolog-colored-line-formatter": "^2",
-        "kelunik/acme": "dev-master",
-        "kelunik/certificate": "dev-master",
+        "amphp/process": "^0.1.1",
+        "kelunik/acme": "^0.3",
+        "kelunik/certificate": "^1",
         "league/climate": "^3",
-        "monolog/monolog": "^1.17",
-        "psr/log": "^1",
-        "rdlowrey/auryn": "^1"
+        "rdlowrey/auryn": "^1",
+        "webmozart/assert": "^1",
+        "symfony/yaml": "^3.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^4|^5",
+        "friendsofphp/php-cs-fixer": "^1.9",
+        "macfja/phar-builder": "^0.2.5"
     },
     "license": "MIT",
     "authors": [
@@ -25,6 +38,35 @@
     "autoload": {
         "psr-4": {
             "Kelunik\\AcmeClient\\": "src"
+        },
+        "files": [
+            "src/functions.php"
+        ]
+    },
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/kelunik/pharbuilder"
+        }
+    ],
+    "extra": {
+        "phar-builder": {
+            "compression": "GZip",
+            "name": "acme-client.phar",
+            "output-dir": "build",
+            "include": ["info", "src", "vendor/kelunik/acme/res", "vendor/amphp/socket/var"],
+            "entry-point": "bin/acme",
+            "events": {
+                "command.package.start": [
+                    "mkdir -p info",
+                    "git describe --tags > info/build.version",
+                    "php -r 'echo time();' > info/build.time"
+                ],
+                "command.package.end": [
+                    "rm -rf info",
+                    "chmod +x build/acme-client.phar"
+                ]
+            }
         }
     }
 }

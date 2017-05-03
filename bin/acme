@@ -2,88 +2,144 @@
 <?php
 
 use Auryn\Injector;
-use Bramus\Monolog\Formatter\ColoredLineFormatter;
-use Kelunik\AcmeClient\LoggerColorScheme;
+use Kelunik\AcmeClient\AcmeFactory;
 use League\CLImate\CLImate;
-use Monolog\Handler\StreamHandler;
-use Monolog\Logger;
+
+$logo = <<<LOGO
+    ____ __________ ___  ___
+   / __ `/ ___/ __ `__ \/ _ \
+  / /_/ / /__/ / / / / /  __/
+  \__,_/\___/_/ /_/ /_/\___/
+
+LOGO;
+
+if (!file_exists(__DIR__ . "/../vendor/autoload.php")) {
+    echo $logo;
+    echo <<<HELP
+
+  You need to install the composer dependencies.
+
+    composer install --no-dev
+
+
+HELP;
+    exit(-1);
+}
+
+if (!function_exists("openssl_pkey_get_private")) {
+    echo $logo;
+    echo <<<HELP
+
+  You need to enable OpenSSL in your php.ini
+
+
+HELP;
+    exit(-2);
+}
 
 require __DIR__ . "/../vendor/autoload.php";
 
+$commands = [
+    "auto" => "Setup, issue and renew based on a single configuration file.",
+    "setup" => "Setup and register account.",
+    "issue" => "Issue a new certificate.",
+    "check" => "Check if a certificate is still valid long enough.",
+    "revoke" => "Revoke a certificate.",
+    "status" => "Show status about local certificates.",
+    "version" => "Print version information.",
+    "help" => "Print this help information.",
+];
+
+$binary = \Kelunik\AcmeClient\getBinary();
+
+$help = implode(PHP_EOL, array_map(function ($command) use ($commands) {
+    $help = "  <green>{$command}</green>\n";
+    $help .= "  └─ {$commands[$command]}\n";
+    return $help;
+}, array_keys($commands)));
+
 $help = <<<EOT
 
-      ____ __________ ___  ___
-     / __ `/ ___/ __ `__ \/ _ \
-    / /_/ / /__/ / / / / /  __/
-    \__,_/\___/_/ /_/ /_/\___/
+<yellow>Usage:</yellow>
+  bin/acme [command] [--args]
 
-    Usage: bin/acme command --args
+<yellow>Options:</yellow>
+  <green>-h, --help</green>
+  └─ Print this help information.
 
-    Available Commands:
-    bin/acme register
-    bin/acme issue
-    bin/acme revoke
-
-    Get more help by appending --help to specific commands.
-
+<yellow>Available commands:</yellow>
+{$help}
+Get more help by appending <yellow>--help</yellow> to specific commands.
 
 EOT;
 
-$commands = [
-    "issue" => "Kelunik\\AcmeClient\\Commands\\Issue",
-    "register" => "Kelunik\\AcmeClient\\Commands\\Register",
-    "revoke" => "Kelunik\\AcmeClient\\Commands\\Revoke",
-];
-
 $climate = new CLImate;
-$injector = new Injector;
 
-if (!isset($argv)) {
-    $climate->error("\$argv is not defined");
+if (!in_array(PHP_SAPI, ["cli", "phpdbg"], true)) {
+    $climate->error("Please run this script on the command line!");
     exit(1);
 }
 
-if (count($argv) === 1 || $argv[1] === "-h" || $argv[1] === "--help" || $argv[1] === "help") {
-    print $help;
+if (PHP_VERSION_ID < 50600) {
+    $climate->yellow("You're using an older version of PHP which is no longer supported and will not even receive security fixes anymore. Have a look at http://php.net/supported-versions.php and upgrade now!");
+    $climate->br(2);
+}
+
+if (count($argv) === 1 || in_array($argv[1], ["-h", "help", "--help"], true)) {
+    $climate->out($logo . $help);
     exit(0);
 }
 
-if (!array_key_exists($argv[1], $commands)) {
-    $climate->error("Unknown command: '{$argv[1]}'");
+if (!in_array($argv[1], array_keys($commands))) {
+    $climate->error("Unknown command '{$argv[1]}'. Use --help for a list of available commands.");
+
+    $suggestion = \Kelunik\AcmeClient\suggestCommand($argv[1], array_keys($commands));
+
+    if ($suggestion) {
+        $climate->br()->out("  Did you mean '$suggestion'?");
+    }
+
+    $climate->br();
 
     exit(1);
 }
 
+/** @var \Kelunik\AcmeClient\Commands\Command $class */
+$class = "Kelunik\\AcmeClient\\Commands\\" . ucfirst($argv[1]);
+$definition = $class::getDefinition();
+
 try {
-    $climate->arguments->add($commands[$argv[1]]::getDefinition());
-    $climate->arguments->parse();
-} catch (Exception $e) {
-    if ($climate->arguments->defined("help")) {
-        print $help;
+    $args = $argv;
+    unset($args[1]);
+
+    $climate->arguments->add($definition);
+
+    if (count($argv) === 3 && in_array($argv[2], ["-h", "--help"], true)) {
+        $climate->usage(["{$binary} {$argv[1]}"]);
+        $climate->br();
 
         exit(0);
     } else {
-        $climate->error($e->getMessage());
-
-        exit(1);
+        $climate->arguments->parse(array_values($args));
     }
+} catch (Exception $e) {
+    $climate->usage(["{$binary} {$argv[1]}"]);
+    $climate->br();
+
+    $climate->error($e->getMessage());
+    $climate->br();
+
+    exit(1);
 }
 
-$handler = new StreamHandler("php://stdout", Logger::DEBUG);
-$handler->setFormatter(new ColoredLineFormatter(new LoggerColorScheme, null, null, true, true));
+$injector = new Injector;
+$injector->share($climate);
+$injector->share(new AcmeFactory);
 
-$logger = new Logger("ACME");
-$logger->pushHandler($handler);
+$command = $injector->make($class);
 
-$injector->alias("Psr\\Log\\LoggerInterface", Logger::class);
-$injector->share($logger);
-
-$command = $injector->make($commands[$argv[1]]);
-
-Amp\run(function () use ($command, $climate, $logger) {
-    try {
-        yield $command->execute($climate->arguments);
-    } catch (Throwable $e) {
+Amp\run(function () use ($command, $climate) {
+    $handler = function ($e) use ($climate) {
         $error = (string) $e;
         $lines = explode("\n", $error);
         $lines = array_filter($lines, function ($line) {
@@ -91,10 +147,24 @@ Amp\run(function () use ($command, $climate, $logger) {
         });
 
         foreach ($lines as $line) {
-            $logger->error($line);
+            $climate->error($line)->br();
         }
 
         exit(1);
+    };
+
+    try {
+        $exitCode = (yield $command->execute($climate->arguments));
+
+        if ($exitCode === null) {
+            exit(0);
+        }
+
+        exit($exitCode);
+    } catch (Throwable $e) {
+        $handler($e);
+    } catch (Exception $e) {
+        $handler($e);
     }
 
     Amp\stop();
