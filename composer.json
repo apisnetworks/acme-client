@@ -14,7 +14,7 @@
         "php": "^5.5|^7",
         "ext-openssl": "*",
         "amphp/process": "^0.1.1",
-        "kelunik/acme": "^0.3",
+        "kelunik/acme": "dev-master",
         "kelunik/certificate": "^1",
         "league/climate": "^3",
         "rdlowrey/auryn": "^1",
@@ -47,7 +47,11 @@
         {
             "type": "vcs",
             "url": "https://github.com/kelunik/pharbuilder"
-        }
+        },
+		{
+			"type": "vcs",
+			"url": "https://github.com/apisnetworks/acme"
+		}
     ],
     "extra": {
         "phar-builder": {
